@@ -12,6 +12,6 @@
 #ifndef UART_CFG_H
 #define UART_CFG_H
 
-#define UART_USE_DMA
+#define UART_MODE                   UART_MODE_ASYNC
 
 #endif
