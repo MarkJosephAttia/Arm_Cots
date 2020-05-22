@@ -11,7 +11,9 @@
 #include "Std_Types.h"
 #include "Uart_Cfg.h"
 #include "Uart.h"
+#if UART_MODE == UART_MODE_DMA
 #include "Dma.h"
+#endif
 
 #define UART_NUMBER_OF_MODULES        3
 
@@ -47,70 +49,43 @@ typedef struct
 #define UART_BUFFER_IDLE 0
 #define UART_BUFFER_BUSY 1
 
-/*Transmit data register
-              empty*/
 #define UART_TXE_CLR 0xFFFFFF7F
-/*Transmission complete*/
 #define UART_TC_CLR 0xFFFFFFBF
-/*Read data register not
-              empty*/
 #define UART_RXNE_CLR 0xFFFFFFDF
-/*Parity error*/
 #define UART_PE_CLR 0xFFFFFFFE
-/*Data value*/
 #define UART_DR_CLR 0xFFFFFE00
-/*STOP bits*/
 #define UART_STOP_CLR 0xFFFFCFFF
-/*TXE interrupt enable*/
 #define UART_TXEIE_CLR 0xFFFFFF7F
-/*Parity selection*/
 #define UART_PS_CLR 0xFFFFFDFF
-/*Word length*/
-#define	UART_M_CLR				0xFFFFEFFF
-
-/*Transmit data register
-              empty*/
+#define UART_M_CLR 0xFFFFEFFF
+#define UART_LBD_CLR 0xFFFFFEFF
+#define UART_LBDIE_CLR 0xFFFFFFBF
 #define UART_TXE_GET 0x00000080
-/*Transmission complete*/
 #define UART_TC_GET 0x00000040
-/*Read data register not
-              empty*/
 #define UART_RXNE_GET 0x00000020
-/*Parity error*/
 #define UART_PE_GET 0x00000001
-
-/*USART enable*/
 #define UART_UE_SET 0x00002000
-/*Parity control enable*/
 #define UART_PCE_SET 0x00000400
-
-/*PE interrupt enable*/
 #define UART_PEIE_SET 0x00000100
-/*TXE interrupt enable*/
 #define UART_TXEIE_SET 0x00000080
-/*Transmission complete interrupt
-              enable*/
 #define UART_TCIE_SET 0x00000040
-/*RXNE interrupt enable*/
 #define UART_RXNEIE_SET 0x00000020
-/*IDLE interrupt enable*/
 #define UART_IDLEIE_SET 0x00000010
-/*Transmitter enable*/
 #define UART_TE_SET 0x00000008
-/*Receiver enable*/
 #define UART_RE_SET 0x00000004
-/*Word length*/
-#define	UART_M_SET 0x00001000
-
-/*DMA enable transmitter*/
-#define UART_DMAT_SET       0x00000080
-/*DMA enable receiver*/
-#define UART_DMAR_SET       0x00000040
-
-/*RTS enable*/
+#define UART_M_SET 0x00001000
+#define UART_LBD_SET 0x00000100
+#define UART_LBDIE_SET 0x00000040
+#define UART_DMAT_SET 0x00000080
+#define UART_DMAR_SET 0x00000040
+#define UART_SBK_SET 0x00000001
+#define UART_LINEN_CLR 0xFFFFBFFF
 #define UART_RTSE_CLR 0xFFFFFEFF
 
 #define UART_NO_PRESCALER 0x1
+
+#define DMA_DID_NOT_RECEIVE             0
+#define DMA_RECEIVED                    1
 
 /**
  * @brief The Base Adresses of the UART module
@@ -122,15 +97,19 @@ const uint32_t Uart_Address[UART_NUMBER_OF_MODULES] = {
   0x40004800
 };
 
-#ifndef UART_USE_DMA
+
 static volatile dataBuffer_t txBuffer[UART_NUMBER_OF_MODULES];
 static volatile dataBuffer_t rxBuffer[UART_NUMBER_OF_MODULES];
-#endif
 
 static volatile txCb_t appTxNotify[UART_NUMBER_OF_MODULES];
 static volatile rxCb_t appRxNotify[UART_NUMBER_OF_MODULES];
+static volatile brCb_t appBreakNotify[UART_NUMBER_OF_MODULES];
 
-#ifdef UART_USE_DMA
+static volatile uint8_t Uart_interrupt[UART_NUMBER_OF_MODULES];
+
+static volatile uint8_t  Uart_dmaRec[UART_NUMBER_OF_MODULES];
+
+#if UART_MODE == UART_MODE_DMA
 const volatile uint8_t Uart_DmaTxChannelNumber[UART_NUMBER_OF_MODULES] =
 {
   DMA_CH_4,
@@ -145,6 +124,10 @@ const volatile uint8_t Uart_DmaRxChannelNumber[UART_NUMBER_OF_MODULES] =
 };
 #endif
 
+static void USART1_DMA_IRQHandler(void);
+static void USART2_DMA_IRQHandler(void);
+static void USART3_DMA_IRQHandler(void);
+
 /**
  * @brief The Interrupt Handler for the UART driver
  * 
@@ -156,9 +139,19 @@ const volatile uint8_t Uart_DmaRxChannelNumber[UART_NUMBER_OF_MODULES] =
 static void UART_IRQHandler(uint8_t uartModule)
 {
   volatile uart_t* Uart = (volatile uart_t*)Uart_Address[uartModule];
-#ifndef UART_USE_DMA
+  /* If a Lin break is generated */
+  if((UART_LBD_SET & Uart->SR) && (Uart_interrupt[uartModule] & UART_INTERRUPT_LBD))
+  {
+    /* Clear The Lin Break Flag */
+    Uart->SR &= UART_LBD_CLR;
+    if (appBreakNotify[uartModule])
+    {
+      appBreakNotify[uartModule](uartModule);
+    }
+  }
+#if UART_MODE == UART_MODE_ASYNC
   /* If the TX is Empty */
-  if (UART_TXE_GET & Uart->SR)
+  if ( (UART_TXE_GET & Uart->SR) && (Uart_interrupt[uartModule] & UART_INTERRUPT_TXE) )
   {
     /* If there is still data in the buffer */
     if (txBuffer[uartModule].size != txBuffer[uartModule].pos)
@@ -179,7 +172,30 @@ static void UART_IRQHandler(uint8_t uartModule)
     }
   }
 
-  if (UART_RXNE_GET & Uart->SR)
+  /* If the TX is Complete */
+  if ( (UART_TC_GET & Uart->SR) && (Uart_interrupt[uartModule] & UART_INTERRUPT_TC) )
+  {
+    /* Clear The Flag */
+    Uart->SR &= UART_TC_CLR;
+    /* If there is still data in the buffer */
+    if (txBuffer[uartModule].size != txBuffer[uartModule].pos)
+    {
+      Uart->DR = txBuffer[uartModule].ptr[txBuffer[uartModule].pos++];
+    }
+    else
+    {
+      txBuffer[uartModule].ptr = NULL;
+      txBuffer[uartModule].size = 0;
+      txBuffer[uartModule].pos = 0;
+      txBuffer[uartModule].state = UART_BUFFER_IDLE;
+      if (appTxNotify[uartModule])
+      {
+        appTxNotify[uartModule](uartModule);
+      }
+    }
+  }
+
+  if ( (UART_RXNE_GET & Uart->SR) && (Uart_interrupt[uartModule] & UART_INTERRUPT_RXNE))
   {
     Uart->SR &= UART_RXNE_CLR;
     /* If there is still data to receive */
@@ -201,10 +217,12 @@ static void UART_IRQHandler(uint8_t uartModule)
       }
     }
   }
-#else
+#endif
+#if UART_MODE == UART_MODE_DMA
   /* If the Transmittion is Complete */
-  if (UART_TC_GET & Uart->SR)
+  if ( (UART_TC_GET & Uart->SR) && (Uart_interrupt[uartModule] & UART_INTERRUPT_TC) )
   {
+    /* Clear The Flag */
     Uart->SR &= UART_TC_CLR;
     txBuffer[uartModule].state = UART_BUFFER_IDLE;
     if (appTxNotify[uartModule])
@@ -212,8 +230,9 @@ static void UART_IRQHandler(uint8_t uartModule)
       appTxNotify[uartModule](uartModule);
     }
   }
-  else
+  if(Uart_dmaRec[uartModule] == DMA_RECEIVED)
   {
+    Uart_dmaRec[UART2] = DMA_DID_NOT_RECEIVE;
     rxBuffer[uartModule].state = UART_BUFFER_IDLE;
     if (appRxNotify[uartModule])
     {
@@ -227,67 +246,20 @@ static void UART_IRQHandler(uint8_t uartModule)
 /**
  * @brief Initializes the UART
  *
- * @param baudRate the baud rate of the UART (uint32_t)
- * @param stopBits The number of the stop bits
- *                 @arg UART_ONE_STOP_BIT
- *                 @arg UART_TWO_STOP_BITS
- * @param parity The parity of the transmission
- *                 @arg UART_ODD_PARITY
- *                 @arg UART_EVEN_PARITY
- *                 @arg UART_NO_PARITY
- * @param flowControl the flow control
- *                 @arg UART_FLOW_CONTROL_EN
- *                 @arg UART_FLOW_CONTROL_DIS
- * @param sysClk the clock of the system
- * @param uartModule the module number of the UART
- *                 @arg UART1
- *                 @arg UART2
- *                 @arg UART3
+ * @param cfg The Uart Configurations
  * @return Std_ReturnType A Status
  *                  E_OK: If the function executed successfully
  *                  E_NOT_OK: If the did not execute successfully
  */
-Std_ReturnType Uart_Init(uint32_t baudRate, uint32_t stopBits, uint32_t parity, uint32_t flowControl, uint32_t sysClk, uint8_t uartModule)
+Std_ReturnType Uart_Init(Uart_cfg_t* cfgUart)
 {
-#ifndef UART_USE_DMA
-  volatile uart_t* Uart = (volatile uart_t*)Uart_Address[uartModule];
-  f64 tmpBaudRate = ((f64)sysClk / ((f64)baudRate * 16.0));
-  /* Clear Baudrate Register and set the mantissa */
-  Uart->BRR = ((uint32_t)(tmpBaudRate)) << 4;
-  /* Setting the fraction */
-  Uart->BRR |= (uint32_t)((tmpBaudRate - (f64)((uint32_t)tmpBaudRate))*16.0);
-  /* Setting the parity bit */
-  if (UART_NO_PARITY == parity)
-  {
-    Uart->CR1 &= UART_M_CLR;
-    Uart->CR1 &= UART_NO_PARITY;
-  }
-  else
-  {
-    Uart->CR1 |= UART_M_SET;
-    Uart->CR1 |= UART_PCE_SET;
-    Uart->CR1 &= UART_PS_CLR;
-    Uart->CR1 |= parity;
-  }
-  /* Setting the stop bit */
-  Uart->CR2 &= UART_STOP_CLR;
-  Uart->CR2 |= stopBits;
-  /* Set the hardware flowcontrol */
-  Uart->CR3 &= UART_RTSE_CLR;
-  Uart->CR3 |= flowControl;
-  Uart->GTPR |= UART_NO_PRESCALER;
-  /* Set the buffer states to idle */
-  rxBuffer[uartModule].state = UART_BUFFER_IDLE;
-  txBuffer[uartModule].state = UART_BUFFER_IDLE;
-  /* Enable the UART, Receiver, Transmitter and the Receiver not empty interrupt */
-  Uart->CR1 |= UART_UE_SET | UART_RXNEIE_SET | UART_TE_SET | UART_RE_SET;
-#else
-  volatile uart_t* Uart = (volatile uart_t*)Uart_Address[uartModule];
-  f64 tmpBaudRate = ((f64)sysClk / ((f64)baudRate * 16.0));
+  volatile uart_t* Uart = (volatile uart_t*)Uart_Address[cfgUart->uartModule];
+  f64 tmpBaudRate = ((f64)cfgUart->sysClk / ((f64)cfgUart->baudRate));
+#if UART_MODE == UART_MODE_DMA
   /* Tx Configurations */
   dmaPrephCfg_t cfg = 
   {
-    .channel = Uart_DmaTxChannelNumber[uartModule],
+    .channel = Uart_DmaTxChannelNumber[cfgUart->uartModule],
     .interrupt = DMA_INT_NO_INT,
     .direction = DMA_READ_FROM_MEM,
     .circular = DMA_CIRCULAR_MODE_OFF,
@@ -297,53 +269,64 @@ Std_ReturnType Uart_Init(uint32_t baudRate, uint32_t stopBits, uint32_t parity, 
     .memSize = DMA_MEM_8_BIT,
     .priority = DMA_PRIORITY_HIGH
   };
-  Dma_ConfigurePrephChannel(&cfg);
-  /* Rx Configure */
-  cfg.channel = Uart_DmaRxChannelNumber[uartModule];
-  cfg.interrupt = DMA_INT_TRANSFER_COMPLETE;
-  cfg.direction = DMA_READ_FROM_PREPH;
-  Dma_ConfigurePrephChannel(&cfg);
-  switch(uartModule)
-  {
-    case UART1:
-      Dma_SetCallBack(Uart_DmaRxChannelNumber[uartModule], USART1_DMA_IRQHandler);
-      break;
-    case UART2:
-      Dma_SetCallBack(Uart_DmaRxChannelNumber[uartModule], USART2_DMA_IRQHandler);
-      break;
-    case UART3:
-      Dma_SetCallBack(Uart_DmaRxChannelNumber[uartModule], USART3_DMA_IRQHandler);
-      break;
-  }
-  /* Clear Baudrate Register and set the mantissa */
-  Uart->BRR = ((uint32_t)(tmpBaudRate)) << 4;
-  /* Setting the fraction */
-  Uart->BRR |= (uint32_t)((tmpBaudRate - (f64)((uint32_t)tmpBaudRate))*16.0);
+#endif
+  Uart_interrupt[cfgUart->uartModule] = cfgUart->interrupts;
+  /* Set Baudrate */
+  Uart->BRR = ((uint16_t)(tmpBaudRate));
   /* Setting the parity bit */
-  if (UART_NO_PARITY == parity)
+  if (UART_NO_PARITY == cfgUart->parity)
   {
     Uart->CR1 &= UART_M_CLR;
     Uart->CR1 &= UART_NO_PARITY;
   }
   else
   {
-    Uart->CR1 |= UART_M_SET;
-    Uart->CR1 |= UART_PCE_SET;
     Uart->CR1 &= UART_PS_CLR;
-    Uart->CR1 |= parity;
+    Uart->CR1 |= cfgUart->parity | UART_M_SET | UART_PCE_SET;
   }
-  /* Setting the stop bit */
-  Uart->CR2 &= UART_STOP_CLR;
-  Uart->CR2 |= stopBits;
+  /* Setting the stop bit and Lin Break Interrupt */
+  Uart->CR2 &= UART_STOP_CLR & UART_LBDIE_CLR & UART_LINEN_CLR;
+  Uart->CR2 |= cfgUart->stopBits | cfgUart->linEn;
+  if(UART_INTERRUPT_LBD & cfgUart->interrupts)
+  {
+    Uart->CR2 |= UART_LBDIE_SET;
+  }
   /* Set the hardware flowcontrol */
   Uart->CR3 &= UART_RTSE_CLR;
-  Uart->CR3 |= flowControl | UART_DMAT_SET | UART_DMAR_SET;
+#if UART_MODE == UART_MODE_DMA
+  /* DMA Configurations */
+  Dma_ConfigurePrephChannel(&cfg);
+  /* Rx Configure */
+  cfg.channel = Uart_DmaRxChannelNumber[cfgUart->uartModule];
+  cfg.interrupt = DMA_INT_TRANSFER_COMPLETE;
+  cfg.direction = DMA_READ_FROM_PREPH;
+  Dma_ConfigurePrephChannel(&cfg);
+  switch(cfgUart->uartModule)
+  {
+    case UART1:
+      Dma_SetCallBack(Uart_DmaRxChannelNumber[cfgUart->uartModule], USART1_DMA_IRQHandler);
+      break;
+    case UART2:
+      Dma_SetCallBack(Uart_DmaRxChannelNumber[cfgUart->uartModule], USART2_DMA_IRQHandler);
+      break;
+    case UART3:
+      Dma_SetCallBack(Uart_DmaRxChannelNumber[cfgUart->uartModule], USART3_DMA_IRQHandler);
+      break;
+  }
+  Uart->CR3 |= UART_DMAT_SET | UART_DMAR_SET;
+#endif
+  Uart->CR3 |= cfgUart->flowControl;
   Uart->GTPR |= UART_NO_PRESCALER;
   /* Set the buffer states to idle */
-  rxBuffer[uartModule].state = UART_BUFFER_IDLE;
-  txBuffer[uartModule].state = UART_BUFFER_IDLE;
+  rxBuffer[cfgUart->uartModule].state = UART_BUFFER_IDLE;
+  txBuffer[cfgUart->uartModule].state = UART_BUFFER_IDLE;
+  Uart->SR &= UART_TC_CLR;
+#if UART_MODE == UART_MODE_DMA
   /* Enable the UART, Receiver, Transmitter and the Receiver not empty interrupt */
-  Uart->CR1 |= UART_UE_SET | UART_TCIE_SET | UART_TE_SET | UART_RE_SET;
+  Uart->CR1 |= UART_UE_SET | UART_TE_SET | UART_RE_SET | (UART_TCIE_SET & cfgUart->interrupts) | (UART_LBDIE_SET & cfgUart->interrupts);
+#else
+  /* Enable the UART, Receiver, Transmitter and the Receiver not empty interrupt */
+  Uart->CR1 |= UART_UE_SET | UART_TE_SET | UART_RE_SET | (UART_LBDIE_SET & cfgUart->interrupts);;
 #endif
   return E_OK;
 }
@@ -368,20 +351,31 @@ Std_ReturnType Uart_Send(uint8_t *data, uint16_t length, uint8_t uartModule)
   /*If there is valid data and length and the TX buffer is idle*/
   if (data && (length > 0) && txBuffer[uartModule].state == UART_BUFFER_IDLE)
   {
-#ifndef UART_USE_DMA
+
+#if UART_MODE == UART_MODE_ASYNC
     txBuffer[uartModule].state = UART_BUFFER_BUSY;
     txBuffer[uartModule].ptr = data;
     txBuffer[uartModule].pos = 0;
     txBuffer[uartModule].size = length;
 
     Uart->DR = txBuffer[uartModule].ptr[txBuffer[uartModule].pos++];
-    Uart->CR1 |= UART_TXEIE_SET;
-    error = E_OK;
-#else
-  txBuffer[uartModule].state = UART_BUFFER_BUSY;
-  Dma_TransferPrephData(Uart_DmaTxChannelNumber[uartModule],(uint32_t)(&(Uart->DR)), (uint32_t)data, length);
-  error = E_OK;
+    if(Uart_interrupt[uartModule] & UART_INTERRUPT_TXE)
+    {
+        Uart->CR1 |= UART_TXEIE_SET;
+    }
+    if(Uart_interrupt[uartModule] & UART_INTERRUPT_TC)
+    {   
+      Uart->SR &= UART_TC_CLR;
+      Uart->CR1 |= UART_TCIE_SET;;
+    }
 #endif
+
+#if UART_MODE == UART_MODE_DMA
+    txBuffer[uartModule].state = UART_BUFFER_BUSY;
+    Dma_TransferPrephData(Uart_DmaTxChannelNumber[uartModule],(uint32_t)(&(Uart->DR)), (uint32_t)data, length);
+#endif
+
+    error = E_OK;
   }
   return error;
 }
@@ -405,20 +399,92 @@ Std_ReturnType Uart_Receive(uint8_t *data, uint16_t length, uint8_t uartModule)
   /* If the RX buffer is idle */
   if (rxBuffer[uartModule].state == UART_BUFFER_IDLE)
   {
-#ifndef UART_USE_DMA
+
+#if UART_MODE == UART_MODE_ASYNC
     rxBuffer[uartModule].ptr = data;
     rxBuffer[uartModule].size = length;
     rxBuffer[uartModule].pos = 0;
     rxBuffer[uartModule].state = UART_BUFFER_BUSY;
-    error = E_OK;
-#else
-  rxBuffer[uartModule].state = UART_BUFFER_BUSY;
-  Dma_TransferPrephData(Uart_DmaRxChannelNumber[uartModule],(uint32_t)(&(Uart->DR)), (uint32_t)data, length);
-  error = E_OK;
+    if(Uart_interrupt[uartModule] & UART_INTERRUPT_RXNE)
+    {   
+      Uart->CR1 |= UART_RXNEIE_SET;
+    }
 #endif
+
+#if UART_MODE == UART_MODE_DMA
+    rxBuffer[uartModule].state = UART_BUFFER_BUSY;
+    Dma_TransferPrephData(Uart_DmaRxChannelNumber[uartModule],(uint32_t)(&(Uart->DR)), (uint32_t)data, length);
+#endif
+
+    error = E_OK;
   }
   return error;
 }
+/**
+ * @brief Sends data through the UART synchronously
+ *
+ * @param data The data to send
+ * @param length the length of the data in bytes
+ * @param uartModule the module number of the UART
+ *                 @arg UART1
+ *                 @arg UART2
+ *                 @arg UART3
+ * @return Std_ReturnType A Status
+ *                  E_OK: If the driver is ready to send
+ *                  E_NOT_OK: If the driver can't send data right now
+ */
+Std_ReturnType Uart_SendSync(uint8_t *data, uint16_t length, uint8_t uartModule)
+{
+  Std_ReturnType error = E_NOT_OK;
+  uint16_t itr;
+  volatile uart_t* Uart = (volatile uart_t*)Uart_Address[uartModule];
+  /*If there is valid data and length and the TX buffer is idle*/
+  if (data && (length > 0))
+  {
+    for(itr=0; itr<length; itr++)
+    {
+      Uart->DR = data[itr];
+      while((UART_TXE_GET & Uart->SR) == 0);
+    }
+    if (appTxNotify[uartModule])
+    {
+      appTxNotify[uartModule](uartModule);
+    }
+    error = E_OK;
+  }
+  return error;
+}
+/**
+ * @brief Receives data through the UART synchronously
+ *
+ * @param data The buffer to receive data in
+ * @param length the length of the data in bytes
+ * @param uartModule the module number of the UART
+ *                 @arg UART1
+ *                 @arg UART2
+ *                 @arg UART3
+ * @return Std_ReturnType A Status
+ *                  E_OK: If the driver is ready to receive
+ *                  E_NOT_OK: If the driver can't receive data right now
+ */
+Std_ReturnType Uart_ReceiveSync(uint8_t *data, uint16_t length, uint8_t uartModule)
+{
+  volatile uart_t* Uart = (volatile uart_t*)Uart_Address[uartModule];
+  uint16_t itr;
+  Uart->SR &= UART_RXNE_CLR;
+  for(itr=0; itr<length; itr++)
+  {
+    while((UART_RXNE_GET & Uart->SR) == 0);
+    data[itr] = Uart->DR;
+  }
+  if (appRxNotify[uartModule])
+  {
+    appRxNotify[uartModule](uartModule);
+  }
+  return E_OK;
+}
+
+
 /**
  * @brief Sets the callback function that will be called when transmission is
  * completed
@@ -437,6 +503,7 @@ Std_ReturnType Uart_SetTxCb(txCb_t func, uint8_t uartModule)
   appTxNotify[uartModule] = func;
   return E_OK;
 }
+
 /**
  * @brief Sets the callback function that will be called when receive is
  * completed
@@ -456,7 +523,41 @@ Std_ReturnType Uart_SetRxCb(rxCb_t func, uint8_t uartModule)
   return E_OK;
 }
 
+/**
+ * @brief Sets the callback function that will be called when break happens
+ *
+ * @param func the callback function
+ * @param uartModule the module number of the UART
+ *                 @arg UART1
+ *                 @arg UART2
+ *                 @arg UART3
+ * @return Std_ReturnType A Status
+ *                  E_OK: If the function executed successfully
+ *                  E_NOT_OK: If the did not execute successfully
+ */
+Std_ReturnType Uart_SetBreakCb(brCb_t func, uint8_t uartModule)
+{
+  appBreakNotify[uartModule] = func;
+  return E_OK;
+}
 
+/**
+ * @brief Sends a Lin break of 13 bit length
+ * 
+ * @param uartModule the module number of the UART
+ *                 @arg UART1
+ *                 @arg UART2
+ *                 @arg UART3
+ * @return Std_ReturnType A Status
+ *                  E_OK: If the function executed successfully
+ *                  E_NOT_OK: If the did not execute successfully
+ */
+Std_ReturnType Uart_SendBreak(uint8_t uartModule)
+{
+  volatile uart_t* Uart = (volatile uart_t*)Uart_Address[uartModule];
+  Uart->CR1 |= UART_SBK_SET;
+  return E_OK;
+}
 
 /**
  * @brief The UART 1 Handler
@@ -487,23 +588,26 @@ void USART3_IRQHandler(void)
  * @brief The UART 1 DMA Handler
  * 
  */
-void USART1_DMA_IRQHandler(void)
+static void USART1_DMA_IRQHandler(void)
 {
+  Uart_dmaRec[UART1] = DMA_RECEIVED;
   UART_IRQHandler(UART1);
 }
 /**
  * @brief The UART 2 DMA Handler
  * 
  */
-void USART2_DMA_IRQHandler(void)
+static void USART2_DMA_IRQHandler(void)
 {
+  Uart_dmaRec[UART2] = DMA_RECEIVED;
   UART_IRQHandler(UART2);
 }
 /**
  * @brief The UART 3 DMA Handler
  *
  */
-void USART3_DMA_IRQHandler(void)
+static void USART3_DMA_IRQHandler(void)
 {
+  Uart_dmaRec[UART3] = DMA_RECEIVED;
   UART_IRQHandler(UART3);
 }
